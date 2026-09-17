@@ -11,6 +11,9 @@ using OrderId   = uint64_t;
 using ClientId  = uint32_t;
 using Timestamp = uint64_t;
 
+// Prices are integer cents (2 implied decimals): $150.25 -> 15025.
+// US equities tick at $0.01 above $1.00, so a cent IS the tick.
+// Range covers $0.01 .. $10,000.00 — every US equity except BRK.A.
 constexpr Price  INVALID_PRICE = 0;
 constexpr Price  MIN_PRICE     = 1;
 constexpr Price  MAX_PRICE     = 1'000'000;

@@ -25,7 +25,7 @@ The book is organised so that each part builds on the last:
 | III | Data Structures | Choose the right container and justify it with cache-line arithmetic |
 | IV | Concurrency | Write a correct lock-free queue and explain the memory model |
 | V | Market Microstructure | Explain what an exchange does and how orders match |
-| VI | The System | Walk through every file of TradeFeed |
+| VI | The System | Walk through every file of TradeFeed, including the live market data feed |
 | VII | Interview & Beyond | Answer the hard questions; know the upgrade paths |
 
 Do the exercises. Reading about cache lines is not the same as watching a benchmark go from 400ns to 5ns because you added `alignas(64)`.
@@ -246,10 +246,19 @@ What it does *not* give you: type safety. `add_order(price, qty)` and `add_order
 ### 2.4 Why prices are integers
 
 ```cpp
-constexpr Price MAX_PRICE = 1'000'000;   // $100.0000 with 4 implied decimals
+// Prices are integer cents (2 implied decimals): $150.25 -> 15025.
+constexpr Price MAX_PRICE = 1'000'000;   // $10,000.00
 ```
 
-A price of `$150.25` is stored as `1'502'500`. The decimal point is *implied* — everyone agrees it sits four digits from the right.
+A price of `$150.25` is stored as `15025`. The decimal point is *implied* — everyone agrees it sits two digits from the right.
+
+**Choosing the scale is a real decision, and I got it wrong first.** The original code used four implied decimals with the same `MAX_PRICE`, which caps the book at **$100.0000** — so its own documented example, `$150.25`, would have been rejected by `add_order`, and AAPL at ~$255 was unrepresentable. Nothing caught it because the benchmarks only ever used synthetic prices near 100,000, and under four decimals that reads as a perfectly legal $10.
+
+Connecting a real market data feed (Chapter 30) exposed it immediately: the first AAPL quote failed the range check.
+
+Cents is the right scale for US equities because a cent **is** the tick — Reg NMS Rule 612 sets the minimum increment at $0.01 for anything trading above $1.00, so sub-cent precision would model prices that cannot legally exist. The range then covers $0.01 to $10,000.00, which is every US equity except BRK.A.
+
+The fix was a comment, not code — the integers never changed, only what they mean. That is worth sitting with: **a units bug is invisible to the type system.** `Price` is a `uint32_t` whether it holds cents or ten-thousandths, so the compiler cannot help. This is exactly the class of error that strong typedefs (§2.3) would catch, and the argument for them just got more concrete.
 
 The alternative, `double price = 150.25;`, is wrong for money:
 
@@ -260,11 +269,11 @@ std::cout << (a + b == 0.3);   // prints 0 (false!)
 
 `0.1` has no exact binary representation (it's `0.1000000000000000055511151231257827...`). Every arithmetic operation on doubles rounds. After a million fills, your P&L is off by cents. Worse, `bid_price >= ask_price` — the core matching predicate — becomes unreliable.
 
-Integers are exact. `1'502'500 >= 1'502'499` is always true. Comparison is one `CMP` instruction. And integer division/multiplication by known constants is faster than floating-point equivalents.
+Integers are exact. `15025 >= 15024` is always true. Comparison is one `CMP` instruction. And integer division/multiplication by known constants is faster than floating-point equivalents.
 
 The `'` in `1'000'000` is a C++14 *digit separator*. It's ignored by the compiler; it's purely for human readability.
 
-**Real exchanges do this.** NASDAQ ITCH uses 4 implied decimals in a 32-bit field. CME uses 64-bit mantissa + exponent. Nobody uses `double` for prices.
+**Real exchanges do this.** NASDAQ ITCH uses 4 implied decimals in a 32-bit field (it must cover sub-penny and non-equity instruments); CME uses a 64-bit mantissa plus exponent. The scale differs per venue; the principle does not. Nobody uses `double` for prices.
 
 ### 2.5 `constexpr` vs `const` vs `#define`
 
@@ -984,7 +993,7 @@ __builtin_prefetch(addr, 0, 3);  // read, high temporal locality
 
 This is a *hint* — it issues a load that doesn't block and doesn't fault. Used correctly, it hides a miss by starting the fetch ~50 cycles before you need the data.
 
-TradeFeed does not currently prefetch. The natural place would be in the engine loop: when you pop message N from the ring, prefetch the price level that message N+1 will touch. That's the "1-ahead pipeline" pattern. It's listed as an upgrade path in Chapter 29 — worth mentioning in an interview as "I know where it goes, I haven't measured a need for it yet."
+TradeFeed does not currently prefetch. The natural place would be in the engine loop: when you pop message N from the ring, prefetch the price level that message N+1 will touch. That's the "1-ahead pipeline" pattern. It's listed as an upgrade path in Chapter 30 — worth mentioning in an interview as "I know where it goes, I haven't measured a need for it yet."
 
 ### 6.7 Translation Lookaside Buffer (TLB)
 
@@ -3722,7 +3731,7 @@ A partial message leaves `read_pos` mid-buffer; the next readable event continue
 
 The `memcpy` into an aligned local is the safe way to read a packed struct out of a byte buffer (Chapter 3.7) — casting the buffer pointer directly would be an alignment violation and, strictly, a strict-aliasing violation.
 
-**Known limitation worth naming**: the `for (;;)` read loop parses at most one message per outer iteration and resets `read_pos = 0`, so a read that delivers 64 bytes (two messages) parses the first and discards the second. The fix is a loop that consumes every complete message in the buffer and memmoves the remainder. Fixed-size framing makes this straightforward; it is on the list in Chapter 31.
+**Known limitation worth naming**: the `for (;;)` read loop parses at most one message per outer iteration and resets `read_pos = 0`, so a read that delivers 64 bytes (two messages) parses the first and discards the second. The fix is a loop that consumes every complete message in the buffer and memmoves the remainder. Fixed-size framing makes this straightforward; it is on the list in Chapter 32.
 
 ### Interview Questions
 
@@ -3846,7 +3855,7 @@ Linux 5.1+ offers `io_uring`: two shared ring buffers between userspace and kern
 
 It handles the actual reads and writes, not just readiness notification, so it eliminates both the `epoll_wait` syscall and the subsequent `recv` syscall. For a gateway doing millions of small I/Os per second, that is a significant win.
 
-TradeFeed uses `epoll` because it's portable, universally understood, and the gateway isn't the measured bottleneck. `io_uring` is the documented upgrade path (Chapter 31) — and naming it is how you show you know where the ceiling is.
+TradeFeed uses `epoll` because it's portable, universally understood, and the gateway isn't the measured bottleneck. `io_uring` is the documented upgrade path (Chapter 32) — and naming it is how you show you know where the ceiling is.
 
 ### Interview Questions
 
@@ -4464,7 +4473,7 @@ Being straight about this is more impressive than the numbers:
 
 - **No network.** Everything is in-process. Real end-to-end latency is dominated by NIC, kernel, and TCP — microseconds, not nanoseconds.
 - **Single-threaded engine test.** `bench_engine_throughput` pre-fills the ring and drains it on one thread, so there's no producer/consumer contention.
-- **Synthetic flow.** Uniform random prices in a tight band. Real flow is bursty, clustered at round numbers, and has fat-tailed sizes.
+- **Synthetic flow by default.** Uniform random prices in a tight band; real flow is bursty, clustered at round numbers, and fat-tailed in size. Chapter 29 adds real IEX data via capture-and-replay, which addresses the flow shape — though only at level 1, so depth remains synthetic.
 - **No isolation.** No `isolcpus`, no IRQ affinity — hence the tens-of-microseconds maxima.
 - **One symbol.** No sharding, no cross-book effects.
 
@@ -4495,11 +4504,286 @@ A: A bare segfault, exit 139, with no output. Rebuilt with AddressSanitizer and 
 
 ---
 
+## Chapter 29: Live Market Data
+
+Everything so far has been driven by synthetic flow — uniform random prices in a tight band. Chapter 28.7 lists that as the benchmarks' biggest honesty problem. This chapter connects a real feed.
+
+### 29.1 What the feed is for
+
+Two different goals, and they want different things:
+
+| Goal | Needs | Best source |
+|------|-------|-------------|
+| **Realistic benchmarks** | reproducible, replayable, available offline | captured file |
+| **Live demo** | actually streaming, market hours | WebSocket |
+
+Realistic benchmarking is the more valuable of the two, and it wants *captured* data rather than live — you cannot A/B test an optimisation against a market that has moved on. So the design captures to a file first, and replay is the primary consumer.
+
+### 29.2 Why the feed is a separate binary
+
+Alpaca streams over `wss://` — WebSocket over TLS, carrying JSON. Supporting that means TLS, WebSocket framing, and JSON parsing. The matching engine currently has **zero** external dependencies, and that is a large part of what makes it defensible.
+
+So the feed does not go in the engine:
+
+```
+Alpaca ──wss──▶ tradefeed-feed ──┬──▶ capture file (32-byte records)
+                (links OpenSSL)  │
+                                 └──▶ TCP WireMessages ──▶ Gateway ──▶ Engine
+                                                          (zero deps)
+```
+
+`tradefeed-feed` is a separate executable. It is the only thing that links OpenSSL, and CMake skips it entirely if OpenSSL is absent:
+
+```cmake
+find_package(OpenSSL)
+if(OpenSSL_FOUND)
+    add_executable(tradefeed-feed src/feed/feed_main.cpp src/feed/alpaca_ws.cpp)
+    target_link_libraries(tradefeed-feed PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+else()
+    message(STATUS "OpenSSL not found - skipping tradefeed-feed (Alpaca feed)")
+endif()
+```
+
+**This mirrors how real venues are built.** Market data handlers, order gateways, and matching engines are separate processes with separate failure domains. A feed handler crashing on a malformed packet must not take the matching engine down with it. Here, the exchange needs no code change at all — it already accepts `WireMessage` over TCP, so the feed is just another client.
+
+### 29.3 The Alpaca protocol
+
+Endpoint (free tier, IEX only):
+
+```
+wss://stream.data.alpaca.markets/v2/iex
+```
+
+`v2/sip` is the full consolidated tape and requires a paid subscription; `v2/delayed_sip` is 15-minute delayed. A sandbox host exists at `stream.data.sandbox.alpaca.markets`.
+
+Three messages establish the session:
+
+```json
+{"action":"auth","key":"...","secret":"..."}
+{"action":"subscribe","trades":["AAPL"],"quotes":["AAPL"]}
+```
+
+The server replies `[{"T":"success","msg":"authenticated"}]`, then `[{"T":"subscription",...}]`, then streams arrays of data messages.
+
+**Quote** (`T:"q"`) — top of book:
+
+```json
+{"T":"q","S":"AMD","bx":"K","bp":91.95,"bs":2,"ax":"Q","ap":91.98,"as":1,
+ "c":["R"],"z":"C","t":"2023-04-06T11:54:21.670905508Z"}
+```
+
+`bp`/`bs` are bid price and size, `ap`/`as` ask price and size. **Sizes are in round lots** — `"bs":2` means 200 shares.
+
+**Trade** (`T:"t"`) — an execution print:
+
+```json
+{"T":"t","S":"AAPL","i":628,"x":"K","p":162.92,"s":3,
+ "c":["@","F","T","I"],"z":"C","t":"2023-04-06T11:54:26.838232225Z"}
+```
+
+`p`/`s` are price and size, `c` the condition codes, `i` the trade ID.
+
+Note what a trade does **not** carry: an aggressor side. The tape tells you a trade happened at a price, not who crossed the spread. Inferring direction is the Lee-Ready algorithm — compare the trade price to the prevailing quote midpoint — and it is exactly the input VPIN (Chapter 22.3) needs.
+
+### 29.4 Parsing JSON without a JSON library
+
+The obvious move is nlohmann/json or simdjson. Neither is right here:
+
+- **nlohmann/json** builds a DOM. Every message allocates a map, string keys, and boxed values — hundreds of nanoseconds and several allocations per tick.
+- **simdjson** is genuinely fast but is another dependency, and its strength is large documents; these are 150-byte objects with fixed keys.
+
+These messages have a **known shape**. Every quote has `bp`, `bs`, `ap`, `as`. So scan for the key and parse the value in place:
+
+```cpp
+inline std::optional<std::string_view> field(std::string_view obj, std::string_view key) {
+    char pat[24];
+    const size_t n = key.size();
+    pat[0] = '"';
+    std::memcpy(pat + 1, key.data(), n);
+    pat[n + 1] = '"';
+    pat[n + 2] = ':';
+    const std::string_view needle(pat, n + 3);
+
+    const size_t at = obj.find(needle);
+    if (at == std::string_view::npos) return std::nullopt;
+    return obj.substr(at + needle.size());
+}
+```
+
+The pattern is built as `"key":` — with the quotes and colon — so a key never matches a *value* that happens to contain the same text. No allocation; `std::string_view` is a pointer and a length.
+
+Splitting the array needs one piece of real care. A naive scan for `}` breaks on a symbol containing a brace, so the splitter tracks string state and escapes:
+
+```cpp
+for (size_t i = 0; i < frame.size(); ++i) {
+    const char c = frame[i];
+    if (esc)       { esc = false; continue; }
+    if (c == '\\') { esc = true;  continue; }
+    if (c == '"')  { in_str = !in_str; continue; }
+    if (in_str) continue;
+
+    if (c == '{') { if (depth++ == 0) start = i; }
+    else if (c == '}') { if (--depth == 0) fn(frame.substr(start, i - start + 1)); }
+}
+```
+
+This is not a general JSON parser and should not be mistaken for one — it handles exactly the shapes Alpaca sends. That is a legitimate engineering choice for a known protocol, and it is what production feed handlers do. State it that way rather than claiming you wrote a JSON parser.
+
+### 29.5 Floating point at the boundary
+
+Alpaca sends prices as JSON numbers: `91.95`. The book stores integer cents. The conversion is the one place a `double` legitimately appears:
+
+```cpp
+inline Price to_cents(double dollars) {
+    if (dollars <= 0.0) return INVALID_PRICE;
+    double cents = dollars * 100.0 + 0.5;
+    if (cents > static_cast<double>(MAX_PRICE)) return 0;   // out of range
+    return static_cast<Price>(cents);
+}
+```
+
+The `+ 0.5` is load-bearing. `91.95` is not exactly representable in binary floating point — it is stored as slightly less — so `91.95 * 100.0` yields `9194.999999999998`. A plain cast truncates toward zero and gives **9194**, silently mispricing by a cent on a large fraction of all ticks. Rounding fixes it, and the self-test pins it:
+
+```cpp
+CHECK(feed::to_cents(91.95) == 9195);
+```
+
+This is Chapter 2.4's argument arriving from the other direction. Floating point is fine as a *transport* encoding; it is not fine as a *storage* format. Convert once, at the boundary, and never let a double into the book.
+
+### 29.6 Timestamps
+
+Alpaca sends RFC-3339 with nanosecond precision: `2023-04-06T11:54:26.838232225Z`.
+
+`strptime` cannot parse sub-second fields at all, and `std::get_time` is worse — it goes through the locale, which takes a lock. The format is fixed-width, so parse it positionally, and convert the date with Howard Hinnant's `days_from_civil`:
+
+```cpp
+inline int64_t days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+```
+
+Exact, branch-light, no lookup tables, no leap-year special cases in the caller. It is the algorithm `std::chrono`'s own calendar support is built on and worth knowing by name.
+
+The fractional part must be **scaled**, not read literally — `.5` is 500,000,000 nanoseconds, not 5:
+
+```cpp
+while (digits++ < 9) nanos *= 10;      // pad to nanosecond scale
+```
+
+### 29.7 The capture format
+
+```cpp
+#pragma pack(push, 1)
+struct CaptureRecord {
+    uint8_t  type;        // 'q' or 't'
+    char     symbol[7];
+    uint32_t p1;          // quote: bid price   trade: price
+    uint32_t s1;          // quote: bid size    trade: size
+    uint32_t p2;          // quote: ask price   trade: 0
+    uint32_t s2;          // quote: ask size    trade: 0
+    uint64_t venue_ns;    // exchange timestamp
+};
+static_assert(sizeof(CaptureRecord) == 32);
+#pragma pack(pop)
+```
+
+Fixed 32 bytes, same as `WireMessage` and for the same reasons (Chapter 25.4): no framing, no parsing, `fread` straight into the struct, and record *N* is at byte offset *32N* so seeking is arithmetic. An hour of AAPL quotes is roughly 30 MB.
+
+Reusing `p1/s1/p2/s2` across both message types is a deliberate compaction. A tagged union would be cleaner in the abstract but would not shrink the record — the ring and the file both want fixed-size elements anyway.
+
+### 29.8 Reconstructing orders from level 1
+
+Here is the part to be honest about. The free IEX feed is **level 1 only**: top of book, no depth. The engine wants a stream of orders. Those are different things, so the mapping is a reconstruction:
+
+```cpp
+if (r.type == Quote) {
+    // resting bid and ask at the quoted prices
+    emit(Buy,  r.p1, r.s1 * 100);      // round lots -> shares
+    emit(Sell, r.p2, r.s2 * 100);
+} else {
+    // a trade print carries no side; alternate so neither side starves
+    emit(alternating_side, r.p1, r.s1);
+}
+```
+
+What this **does** give you, and it is the part that matters: real burstiness, real price clustering at round numbers, real fat-tailed size distribution, and real inter-arrival gaps. That is precisely what synthetic uniform flow lacks.
+
+What it does **not** give you: true depth behind the touch, real order IDs, genuine cancel flow, or correct aggressor sides. A book built this way has the right shape at the top and fiction underneath.
+
+The honest framing in an interview: *"I replay real IEX level-1 data to get realistic flow characteristics for benchmarking. It's a reconstruction, not a replica — I only see top of book, so depth is synthetic. Full order-by-order reconstruction needs ITCH, which is what I'd use with a real data budget."*
+
+### 29.9 Using it
+
+```bash
+export APCA_API_KEY_ID=...
+export APCA_API_SECRET_KEY=...
+
+# capture a live session
+./tradefeed-feed --capture aapl.bin AAPL MSFT NVDA
+
+# replay it into a running exchange, as fast as possible
+./tradefeed 9000 &
+./tradefeed-feed --replay aapl.bin --connect 127.0.0.1:9000 --speed 0
+
+# replay at real time, or 10x
+./tradefeed-feed --replay aapl.bin --connect 127.0.0.1:9000 --speed 1
+./tradefeed-feed --replay aapl.bin --connect 127.0.0.1:9000 --speed 10
+```
+
+`--speed 0` removes the inter-arrival delays entirely, which is what you want for throughput benchmarking. `--speed 1` preserves the original gaps and is what you want to see the book behave the way it did on the day.
+
+### 29.10 Testing it without the network
+
+The parsing is the part that can silently be wrong, and it is testable offline. `feed_test` uses Alpaca's own documented example messages as fixtures — 38 assertions covering price rounding, timestamp scaling, both message shapes, control-message rejection, array splitting, a brace inside a symbol, and malformed input:
+
+```
+$ ./feed_test
+feed_test: 38 checks passed
+```
+
+No credentials, no network, no market hours. The end-to-end path is verified separately by generating a synthetic capture file and replaying it — 20,000 ticks produced 36,053 orders and 25,567 matches in the engine.
+
+**Test the parsing offline and the transport separately.** A feed handler that can only be tested during market hours is a feed handler that does not get tested.
+
+### Interview Questions
+
+**Q: Why is the feed a separate binary rather than a thread in the exchange?**
+A: It needs TLS, WebSocket framing, and JSON; the engine has zero external dependencies and that is worth protecting. It also matches how real venues are structured — market data handlers and matching engines are separate processes with separate failure domains, so a malformed packet can't take the engine down. The exchange needed no changes at all; the feed is just another TCP client speaking the existing wire format.
+
+**Q: Why not use a JSON library?**
+A: These are 150-byte objects with fixed, known keys. nlohmann/json would build a DOM and allocate per message; simdjson is fast but is another dependency and is optimised for large documents. Scanning for `"key":` and parsing the value in place is allocation-free and is what production feed handlers do. It's not a general JSON parser and I wouldn't claim it is — it handles exactly the shapes Alpaca sends.
+
+**Q: You said never use floating point for prices, but you parse doubles here.**
+A: Floating point is fine as a transport encoding — that's what's on the wire. It's not fine as a storage format. I convert once at the boundary and never let a double into the book. The conversion rounds rather than truncates, because `91.95 * 100.0` is `9194.999999999998` in binary floating point and a plain cast would silently lose a cent. There's a test pinning exactly that case.
+
+**Q: What can't you do with a level-1 feed?**
+A: Reconstruct a real book. I get top of book only, so depth behind the touch is synthetic, there are no real order IDs, no genuine cancel flow, and trade prints carry no aggressor side. What I do get is real flow shape — burstiness, price clustering, fat-tailed sizes, realistic inter-arrival gaps — which is the thing synthetic benchmarks lack. Order-by-order reconstruction needs ITCH.
+
+**Q: How do you test a feed handler?**
+A: Separate the parsing from the transport. The parsing is pure and gets a self-test using the vendor's own documented example messages as fixtures — 38 assertions, no network, no credentials, runs in CI. The transport gets tested by replaying a synthetic capture file end to end. Anything that can only be tested during market hours won't be.
+
+### Exercises
+
+1. Run `feed_test`. Then break `to_cents` by removing the `+ 0.5` and confirm the `91.95` assertion fires.
+2. Capture 10 minutes of live quotes for a liquid name. Histogram the inter-arrival gaps and compare against the uniform distribution the synthetic benchmarks use.
+3. Replay a real capture through `bench_mixed_workload`'s code path instead of the RNG. How do the p99.9 figures change, and why?
+4. Implement the Lee-Ready algorithm: classify each trade as buy- or sell-initiated by comparing its price to the prevailing quote midpoint. Feed the result into `BookAnalytics::on_fill` so VPIN (Chapter 22.3) runs on real data.
+5. The splitter tracks string state so a `}` inside a symbol can't split an object. Write a test that would fail without that, then remove the tracking and watch it fail.
+6. `--speed 1` uses `usleep`, which has millisecond-ish granularity and cannot pace microsecond gaps. Replace it with a spin-wait on `rdtsc` and measure the improvement in replay fidelity.
+7. Add reconnect-with-backoff to `AlpacaWebSocket`. What happens to the capture file across a reconnect, and how would a consumer detect the gap?
+
+---
+
 # PART VII — MASTERY
 
 ---
 
-## Chapter 29: One Message, End to End
+## Chapter 30: One Message, End to End
 
 Everything in this book, applied to a single order. Follow it with the source open.
 
@@ -4747,7 +5031,7 @@ Every one of those numbers is small because of a specific decision made in Parts
 
 ---
 
-## Chapter 30: The Interview
+## Chapter 31: The Interview
 
 ### 30.1 The 60-second pitch
 
@@ -4834,7 +5118,7 @@ What's left is the `fills_` vector growing past its reserved 64 on a deep sweep 
 **Q: If you had one week, what would you do?**
 Fix the correctness gaps first — gateway-assigned client IDs, backpressure instead of silent drops, per-client routing, and the multi-message read. Those are bugs, not optimisations, and there's no point shaving kernel microseconds while messages are being silently dropped.
 
-Then a proper load-generating client, so I'm measuring end-to-end rather than in-process — right now I can tell you the engine costs 18 ns per order, but I can't tell you what a client actually experiences, and kernel TCP alone is 10–30 µs. After that, AF_XDP, because that's where the real latency is.
+Then end-to-end latency measurement. I can replay real IEX data into the exchange over TCP (Chapter 29), so I have realistic flow — but the feed doesn't timestamp round trips, so I still can't tell you what a client actually experiences. Right now I know the engine costs 18 ns per order and kernel TCP alone is 10–30 µs, which tells me where to look but not the number. After that, AF_XDP, because that's where the real latency is.
 
 The bitset was on this list until recently; it's done, and it's why the book has no non-O(1) operations left.
 
@@ -4851,7 +5135,7 @@ That the algorithmic complexity is almost never the interesting part. Every real
 
 ---
 
-## Chapter 31: Known Gaps and Upgrade Paths
+## Chapter 32: Known Gaps and Upgrade Paths
 
 Being able to enumerate your own system's weaknesses is the strongest signal of seniority. Here is the honest list.
 
@@ -4903,7 +5187,8 @@ Peek at message N+1 while processing N and `__builtin_prefetch` the price level 
 
 ### 31.3 Missing features
 
-- **Market data dissemination.** No ITCH-style UDP multicast feed. Subscribers currently learn nothing; only order owners get fills.
+- **Market data dissemination.** No ITCH-style UDP multicast *outbound* feed. The exchange consumes market data (Chapter 29) but does not publish it; subscribers learn nothing, only order owners get fills.
+- **Level 2 input.** The free IEX feed is top-of-book only, so replayed depth is synthetic. Order-by-order reconstruction needs ITCH.
 - **Symbol sharding.** Single book, single symbol. The path to multi-symbol is one engine thread per shard (§30.2).
 - **Pre-trade risk.** No position limits, fat-finger checks, or credit limits. These are mandatory in reality and sit on the critical path, so they must be cheap — typically a per-client array indexed by `client_id`.
 - **Persistence and recovery.** No input journal, so a crash loses all state. Determinism means a sequenced input log is sufficient to rebuild — that's the design to implement.
@@ -4924,7 +5209,7 @@ Balance matters too — do not only recite faults.
 
 ---
 
-## Chapter 32: Capstone — Build It Yourself
+## Chapter 33: Capstone — Build It Yourself
 
 The real test. Rebuild TradeFeed from an empty directory. Each stage is independently runnable and testable — do not proceed until the current one works.
 
@@ -4984,7 +5269,7 @@ Write `sbe_messages.h` and `matching_engine.h`/`.cpp`.
 
 Write `socket_transport.h`. Handle partial reads, `EAGAIN`, disconnection, and the edge-triggered drain loop.
 
-**Done when**: a client connects, sends an order split across two `send` calls, and receives the acknowledgement. Then send three messages in one `send` and confirm all three are processed — which requires fixing gap #4 from Chapter 31.
+**Done when**: a client connects, sends an order split across two `send` calls, and receives the acknowledgement. Then send three messages in one `send` and confirm all three are processed — which requires fixing gap #4 from Chapter 32.
 
 ### Stage 9 — Wire it together
 
@@ -5000,7 +5285,7 @@ Write the benchmark suite with TSC calibration and percentile reporting.
 
 ### Stage 11 — Beat it
 
-Pick one item from Chapter 31.2. Implement it. Measure before and after. Write up what changed and why.
+Pick one item from Chapter 32.2. Implement it. Measure before and after. Write up what changed and why.
 
 **That write-up is your portfolio piece.** A system someone built is interesting; a measured improvement someone reasoned their way to is hireable.
 
