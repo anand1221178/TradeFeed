@@ -53,5 +53,6 @@ private:
     bool read_exact(size_t n);
     bool write_all(const void* data, size_t len);
     bool send_frame(uint8_t opcode, const void* payload, size_t len);
+    bool await(std::string_view marker, const char* what);
     void fail(const std::string& what);
 };

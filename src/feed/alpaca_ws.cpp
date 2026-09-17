@@ -254,18 +254,31 @@ bool AlpacaWebSocket::read_frame(std::string& out) {
     }
 }
 
+// Alpaca sends {"T":"success","msg":"connected"} the moment the socket opens,
+// before any client message. Responses are therefore not one-to-one with
+// requests, so wait for the specific message rather than reading a single frame.
+bool AlpacaWebSocket::await(std::string_view marker, const char* what) {
+    std::string reply;
+    for (int i = 0; i < 10; ++i) {          // bounded: never spin on a chatty server
+        if (!read_frame(reply)) return false;
+
+        if (reply.find(marker) != std::string_view::npos) return true;
+
+        if (reply.find(R"("T":"error")") != std::string::npos) {
+            error_ = std::string(what) + " rejected: " + reply;
+            return false;
+        }
+        // anything else (e.g. the connect greeting) is not ours; keep reading
+    }
+    error_ = std::string(what) + ": no response after 10 frames";
+    return false;
+}
+
 bool AlpacaWebSocket::authenticate(const std::string& key, const std::string& secret) {
     const std::string msg =
         R"({"action":"auth","key":")" + key + R"(","secret":")" + secret + R"("})";
     if (!send_text(msg)) return false;
-
-    std::string reply;
-    if (!read_frame(reply)) return false;
-    if (reply.find("\"authenticated\"") == std::string::npos) {
-        error_ = "auth rejected: " + reply;
-        return false;
-    }
-    return true;
+    return await(R"("msg":"authenticated")", "auth");
 }
 
 bool AlpacaWebSocket::subscribe(const std::vector<std::string>& symbols,
@@ -276,14 +289,7 @@ bool AlpacaWebSocket::subscribe(const std::vector<std::string>& symbols,
     msg += "}";
 
     if (!send_text(msg)) return false;
-
-    std::string reply;
-    if (!read_frame(reply)) return false;
-    if (reply.find("\"subscription\"") == std::string::npos) {
-        error_ = "subscribe rejected: " + reply;
-        return false;
-    }
-    return true;
+    return await(R"("T":"subscription")", "subscribe");
 }
 
 void AlpacaWebSocket::close() {
