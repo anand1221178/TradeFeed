@@ -2124,10 +2124,10 @@ if (side == Side::Buy) {
 }
 ```
 
-**On depletion** — scan:
+**On depletion** — this is the hard case. The naive version walks outward:
 
 ```cpp
-void OrderBook::scan_best_bid() {
+void OrderBook::scan_best_bid() {              // ← the ORIGINAL implementation
     for (Price p = best_bid_; p >= MIN_PRICE; --p) {
         if (!bids_[idx(p)].empty()) { best_bid_ = p; return; }
         if (p == MIN_PRICE) break;        // guard: Price is unsigned, --p would wrap
@@ -2138,29 +2138,91 @@ void OrderBook::scan_best_bid() {
 
 The `if (p == MIN_PRICE) break;` is not redundant. `Price` is `uint32_t`; if `MIN_PRICE` were 0, `--p` at 0 wraps to 4 billion and the loop never ends. This is the unsigned-wrap hazard from Chapter 2 showing up in real code.
 
-**Cost:** one iteration per empty price level between the old best and the new one. In a liquid market the next level is 1–5 ticks away — a handful of L1 hits, effectively free. In a thin book after a sweep, it could be thousands. That's the honest weakness of this design, and the mixed-workload p99.9 of 333 ns for cancels reflects exactly this.
+**Cost:** one iteration per empty level between the old best and the new one. In a liquid market the next level is 1–5 ticks away — effectively free. In a thin book after a sweep, it is unbounded. That last case is not hypothetical, as the next section shows.
 
-### 13.8 The upgrade: hierarchical bitset
+### 13.8 A measured 1 ms stall, and the fix
 
-One bit per price level, "is this level non-empty", in three tiers:
+Running `bench_matching` on the i9-10900K target produced this:
 
 ```
-L0: 1,000,000 bits = 15,625 uint64 words   (one bit per price)
-L1:    15,625 bits =    245 uint64 words   (one bit per L0 word: "any bit set below?")
-L2:       245 bits =      4 uint64 words   (one bit per L1 word)
+match_order   n=100000   p50=14ns  p90=23ns  p99=30ns  p99.9=57ns   max=1073882ns
 ```
 
-Finding the highest set bit (best bid):
+A p99.9 of 57 ns and a max of **1.07 milliseconds** — 18,000× the p99.9. It reproduced within 1.5% across runs, so it was deterministic, not a scheduling artefact. (Transparent huge pages were the first hypothesis; disabling `khugepaged` background collapse changed nothing, ruling it out.)
+
+Reproducibility plus a *single* outlier implies something that happens exactly once. The benchmark seeds 100,000 resting asks and sends exactly 100,000 aggressive buys, each consuming exactly one — so **the final order empties the book**, and `scan_best_ask` then walks from price 100,099 all the way to 1,000,000.
+
+Instrumenting the scan confirmed it outright:
+
+```
+Best-price scans: 100 calls, 900100 total steps, 899902 worst single scan
+```
+
+Ninety-nine scans cost **2 steps** each. One cost **899,902** — a 21.6 MB sweep of cold `PriceLevel` array, at ~1.19 ns per step. That single scan *was* the millisecond.
+
+### The hierarchical bitset
+
+One bit per price level — "does this level hold orders?" — in three tiers, each summarising the one below:
+
+```
+L0: 1,000,000 bits → 15,625 uint64 words   (125 KB)  one bit per price
+L1:    15,625 bits →    245 uint64 words   (1.9 KB)  one bit per L0 word
+L2:       245 bits →      4 uint64 words   (32 B)    one bit per L1 word
+```
+
+**Invariant:** an L1 bit is set iff its L0 word is non-zero; likewise L2 over L1.
+
+Finding the highest occupied level (best bid) descends the tiers:
 
 ```cpp
-int w2 = 63 - __builtin_clzll(l2[0]);        // which L1 word
-int w1 = w2*64 + 63 - __builtin_clzll(l1[w2]); // which L0 word
-int w0 = w1*64 + 63 - __builtin_clzll(l0[w1]); // which bit → the price
+size_t highest() const {
+    for (size_t w2 = L2_WORDS; w2-- > 0; ) {
+        if (!l2_[w2]) continue;
+        const size_t w1 = (w2 << 6) + top_bit(l2_[w2]);   // which L1 word
+        const size_t w0 = (w1 << 6) + top_bit(l1_[w1]);   // which L0 word
+        return (w0 << 6) + top_bit(l0_[w0]);              // which bit → the price
+    }
+    return NONE;
+}
+static size_t top_bit(uint64_t w) { return 63 - __builtin_clzll(w); }
 ```
 
-`__builtin_clzll` = count leading zeros, one `LZCNT`/`BSR` instruction. Three loads and three instructions — **truly O(1), independent of book shape**. Total memory: ~2 MB. Maintenance: one bit set on insert, one cleared when a level empties.
+`__builtin_clzll` counts leading zeros — one `LZCNT` instruction. `lowest()` is the mirror image using `__builtin_ctzll` (count *trailing* zeros). Three loads and three instructions, **independent of book shape**.
 
-That removes the only non-O(1) operation in the book. It's the single highest-value improvement available and the right answer to "what would you optimise next?"
+Clearing is the only subtle part — a tier bit may only be cleared once everything below it is empty:
+
+```cpp
+void clear(size_t i) {
+    const size_t w0 = i >> 6;
+    l0_[w0] &= ~(1ULL << (i & 63));
+    if (l0_[w0]) return;                    // word still occupied, stop here
+
+    const size_t w1 = w0 >> 6;
+    l1_[w1] &= ~(1ULL << (w0 & 63));
+    if (l1_[w1]) return;
+
+    l2_[w1 >> 6] &= ~(1ULL << (w1 & 63));
+}
+```
+
+Maintenance cost is near zero because the bitset is touched only on level *transitions* — `set` when pushing to a previously empty level, `clear` when one empties — not on every order.
+
+Total memory: **127 KB**, which fits in L2 cache. (An earlier estimate in this book said ~2 MB; the actual figure is an order of magnitude smaller because the upper tiers are tiny.)
+
+### The result
+
+Same benchmark, after:
+
+| | Linear scan | Hierarchical bitset | Change |
+|---|---|---|---|
+| `match_order` p99.9 | 57 ns | 42 ns | — |
+| `match_order` **max** | **1,073,882 ns** | **84 ns** | **12,780× faster** |
+| Worst single scan | 899,902 steps | 3 loads | — |
+| Cancel p99.9 (mixed) | 461 ns | 292 ns | 1.6× |
+
+The BBO is cross-checked against a brute-force scan (`validate_bbo()`) after every benchmark phase, so the speedup is not being bought with a correctness bug.
+
+**This is the one non-O(1) operation in the book, and it is now O(1).**
 
 ### Interview Questions
 
@@ -2174,15 +2236,19 @@ A: In absolute terms it's 0.07% of the machine's RAM. What matters for speed is 
 A: Unbounded or sparse key spaces — FX at 8 decimals is 10¹² ticks. The fix is a direct-indexed window around the current price with a hash fallback for far strikes, re-centred as the price drifts.
 
 **Q: What's the complexity of finding the best bid?**
-A: O(1) on insert (compare and maybe update). On depletion it's a linear scan from the old best — typically 1–5 ticks in a liquid book, but unbounded in a thin one. The fix is a hierarchical bitset: three `__builtin_clzll` calls, genuinely O(1), ~2 MB. That's my next optimisation.
+A: O(1) both ways now. On insert it's a compare-and-maybe-update. On depletion it's three `__builtin_clzll` lookups through a three-tier occupancy bitset — independent of how far the next occupied level is. It was originally a linear scan, which produced a measured 1 ms stall when the book emptied; the bitset took that max from 1,073,882 ns to 84 ns for 127 KB of extra memory.
+
+**Q: How did you find that stall?**
+A: p99.9 was 57 ns but max was 1.07 ms, reproducible within 1.5% across runs — so deterministic, not scheduling. I first suspected transparent huge pages; disabling background collapse changed nothing, which ruled it out. Reproducible plus a single outlier means something that runs exactly once, and the benchmark consumes exactly as many resting orders as it seeds — so the last order empties the book and triggers a full-range scan. I instrumented the scan to count steps: 99 calls at 2 steps, one at 899,902.
 
 ### Exercises
 
 1. Replace `bids_`/`asks_` with `std::map<Price, PriceLevel>`. Run `bench_orderbook`. Report the slowdown for each operation.
-2. Instrument `scan_best_bid` to count iterations. Run the mixed workload and histogram the counts. What's the p99?
-3. Construct a pathological case: one bid at price 1, one at 999,999, then cancel the top one. Time the resulting scan.
-4. Implement the hierarchical bitset from §13.8. Verify it against the linear scan on random books, then benchmark the pathological case from (3).
-5. Compute the memory for a book supporting $0.00000001–$100,000.00000000 at 8 decimals with direct indexing. Design a windowed alternative and state its lookup cost.
+2. Revert `scan_best_bid`/`scan_best_ask` to the linear version (see git history), re-run `bench_matching`, and reproduce the 1 ms max yourself.
+3. Construct a pathological case by hand: one bid at price 1, one at 999,999, then cancel the top one. Time it with both implementations.
+4. Write a randomised differential test: apply thousands of random add/cancel operations and assert `validate_bbo()` after each. Then deliberately break `PriceBitset::clear` by always clearing all three tiers, and confirm your test catches it.
+5. The bitset is 127 KB across three tiers. Work out how many tiers you would need for an 8-decimal FX book (10¹² ticks), and whether the approach still holds.
+6. Compute the memory for a book supporting $0.00000001–$100,000.00000000 at 8 decimals with direct indexing. Design a windowed alternative and state its lookup cost.
 
 ---
 
@@ -2364,6 +2430,7 @@ The right-hand columns matter more than the complexity column. `std::map` lookup
 | `OrderBook::order_table_` | `unique_ptr<Order*[]>` | direct-address by `id & mask`; heap because 8 MB |
 | `OrderBook::fills_` | `std::vector<Fill>` | append-then-iterate; `reserve(64)` |
 | `PriceLevel` | intrusive doubly-linked | zero-alloc, O(1) push/remove, time priority |
+| `OrderBook::bid_bits_`/`ask_bits_` | 3-tier `PriceBitset` | O(1) best-price lookup via `clz`/`ctz`; 127 KB |
 | `SPSCRing::buffer_` | `T[Capacity]` inline | compile-time size, no indirection |
 | `Gateway::clients_` | `std::array<ClientState, 64>` | fixed small size, inline is fine |
 | `BookAnalytics::vpin_history_` | `std::array<double, 50>` | fixed small ring |
@@ -4359,13 +4426,15 @@ These are the canonical numbers: real x86 TSC, sub-nanosecond resolution, `perfo
 | Operation | p50 | p90 | p99 | p99.9 | max |
 |-----------|-----|-----|-----|-------|-----|
 | Add order (no match) | 8 ns | 30 ns | 88 ns | 380 ns | 29 µs |
-| Cancel order | 24 ns | 87 ns | 166 ns | 466 ns | 26 µs |
-| Match order | 13 ns | 23 ns | 29 ns | 67 ns | **1.08 ms** |
+| Cancel order | 24 ns | 87 ns | 166 ns | 292 ns | 26 µs |
+| Match order | 13 ns | 23 ns | 29 ns | 42 ns | **84 ns** |
 | Mixed: add (resting) | 10 ns | 21 ns | 50 ns | 131 ns | 28 µs |
-| Mixed: cancel | 19 ns | 81 ns | 206 ns | 461 ns | 33 µs |
+| Mixed: cancel | 19 ns | 81 ns | 206 ns | 292 ns | 33 µs |
 | Mixed: match | 45 ns | 163 ns | 288 ns | 411 ns | 28 µs |
 
 Engine throughput: **55M orders/sec**, 18 ns average per order — including ring pop, dispatch, book operation, and outbound emit.
+
+The `match_order` max of 84 ns is post-bitset. Before that change it was **1,073,882 ns** — see Chapter 13.8 for the full diagnosis. The remaining tens-of-microseconds maxima on the other rows are scheduler preemption, not algorithmic.
 
 **SPSC ring** (producer cpu1, consumer cpu2 — distinct physical cores)
 
@@ -4385,16 +4454,9 @@ On SMT siblings those become 22 ns and 206M msg/s — the full comparison is in 
 
 **Push is slower than pop (4.2 vs 1.6 ns).** The burst test writes 65,536 × 64 B = 4 MB, exceeding L2. Every write to an uncached line needs a read-for-ownership — fetch it exclusive before modifying — plus eventual writeback. The following pop reads data that is still resident. Non-temporal stores (`_mm256_stream_si256`) bypass RFO for known-streaming writes, worth trying if the ring ever becomes the constraint.
 
-**The 1.08 ms max on `match_order` is not noise.** It reproduced within 1.5% across runs (1,063,786 ns then 1,079,085 ns) — deterministic, not random preemption. Leading suspect: `khugepaged` collapsing the ~112 MB of arenas (48 MB price levels + 64 MB pool) into 2 MB huge pages in the background, taking page-table locks and copying memory.
+**The `match_order` max used to be 1.08 ms.** That was the best-price linear scan, diagnosed and fixed in Chapter 13.8 — worth reading as a worked example of chasing a tail from symptom to root cause, including the hypothesis (transparent huge pages) that turned out to be wrong.
 
-```bash
-cat /sys/kernel/mm/transparent_hugepage/enabled
-echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled   # re-run and compare
-```
-
-The proper fix is the Chapter 31 item: `madvise(MADV_HUGEPAGE)` on the arenas at construction plus pre-faulting every page at startup, turning a mid-trade stall into a startup cost.
-
-**The 26–33 µs maxima elsewhere** are scheduler preemption — the benchmark shares a core with everything else. `taskset` plus `isolcpus` should remove them.
+**The 26–33 µs maxima elsewhere** are scheduler preemption — the benchmark shares a core with everything else. `taskset -c 3` plus `isolcpus` should remove them. Unlike the 1 ms stall, these are environmental rather than algorithmic, which is why they appear uniformly across every operation instead of on one.
 
 ### 28.7 What the benchmarks don't measure
 
@@ -4691,7 +4753,7 @@ Every one of those numbers is small because of a specific decision made in Parts
 
 > TradeFeed is a limit order book and matching engine in C++20, built to NASDAQ-style price-time priority. The architecture is two pinned threads — a gateway doing epoll and a single-threaded matching engine — connected by lock-free SPSC ring buffers. The engine is single-threaded deliberately: matching must be deterministic for replay and regulatory reconstruction, so real venues shard by symbol rather than parallelising a book.
 >
-> The performance work is all about eliminating memory stalls. Orders come from a pre-allocated pool, so there's no `malloc` on the hot path. Price levels are a direct-indexed array rather than a tree, so a lookup is one array access instead of twenty pointer-chasing cache misses. Each level is an intrusive doubly-linked list, so there's no per-node allocation and cancels are O(1). Order lookup is a direct-address table keyed on `id & mask`, because I assign the IDs sequentially and don't need hashing. The `Order` struct is exactly one cache line with the match-critical fields in the first sixteen bytes.
+> The performance work is all about eliminating memory stalls. Orders come from a pre-allocated pool, so there's no `malloc` on the hot path. Price levels are a direct-indexed array rather than a tree, so a lookup is one array access instead of twenty pointer-chasing cache misses. Each level is an intrusive doubly-linked list, so there's no per-node allocation and cancels are O(1). Order lookup is a direct-address table keyed on `id & mask`, because I assign the IDs sequentially and don't need hashing. Best-price tracking is a three-tier occupancy bitset, so finding the next best level after one empties is three `clz` instructions rather than a scan. The `Order` struct is exactly one cache line with the match-critical fields in the first sixteen bytes.
 >
 > It benchmarks at 55 million orders per second in-process on an i9-10900K, with p50 of 8 nanoseconds on inserts and 13 on matches, and an 84-nanosecond one-way core-to-core handoff through the ring. The honest caveat is those are in-process numbers — real end-to-end latency is dominated by the NIC and kernel, and the next thing I'd build is an AF_XDP data path to attack that.
 
@@ -4724,7 +4786,9 @@ Chained hashing: a bucket array load plus a chain node load, so two-plus depende
 `std::list` allocates a node per insert and adds an indirection, so traversal costs two cache misses per element. Intrusive links live inside the `Order`, which already exists in the pool — zero allocation, one miss, and O(1) removal given just the pointer. Doubly-linked specifically so cancels are O(1); with only `next` I'd need an O(n) walk to find the predecessor, and cancels are twenty percent of flow.
 
 **Q: What's the complexity of finding the best bid?**
-O(1) on insert. On depletion it's a linear scan from the old best — typically one to five ticks in a liquid book, but unbounded in a thin one, and that shows up in my cancel p99.9. The fix is a hierarchical bitset: one bit per level in three tiers, three `__builtin_clzll` calls, genuinely O(1), about 2 MB. That's my highest-value remaining optimisation.
+O(1) both directions. Insert is a compare-and-maybe-update. Depletion goes through a three-tier occupancy bitset — one bit per price level, each tier summarising the one below — so finding the next best is three `__builtin_clzll` lookups regardless of how far away it is. 127 KB of memory, which fits in L2.
+
+It was originally a linear scan outward from the old best, and that produced a measured 1 ms stall: p99.9 of 57 ns against a max of 1.07 ms. The bitset took the max to 84 ns.
 
 ### 30.4 Questions on concurrency
 
@@ -4763,10 +4827,16 @@ Five things, in order of severity. One: clients supply their own `client_id` and
 Unit tests per structure with invariant checks — a `validate()` on `PriceLevel` that walks the list and confirms `count_` and `total_qty_`, and a crossed-book assertion after every book operation. Property-based testing with random operation sequences, checking conservation invariants: total filled quantity is equal on both sides, and pool allocations minus deallocations equals resting orders. Differential testing against a deliberately naive reference implementation using `std::map` and `std::list` — same input, assert identical fills. ThreadSanitizer on the ring. And replay of a captured ITCH session for realistic flow.
 
 **Q: Your p99.9 is 625 ns but p50 is under 42 ns. Explain the gap.**
-Three contributors. The `scan_best_bid`/`scan_best_ask` linear walk when a best level empties — usually one to five ticks, occasionally far more, and that's the dominant one. The `fills_` vector growing past its reserved 64 on a deep sweep, which is one reallocation. And OS scheduling — the max of 12 µs is almost certainly a descheduling event, which is why the target is a pinned, isolated core. The bitset fixes the first, a larger reserve or a fixed-size buffer fixes the second, `isolcpus` and `nohz_full` fix the third.
+The dominant one used to be the best-price scan, and I have the measurement: p99.9 of 57 ns against a max of 1.07 ms, caused by the last order emptying the book and triggering a 899,902-step walk across 21.6 MB. I replaced it with a three-tier bitset and the max went to 84 ns.
+
+What's left is the `fills_` vector growing past its reserved 64 on a deep sweep — one reallocation — and OS scheduling, which is what the remaining tens-of-microseconds maxima are. A larger reserve or a fixed-size buffer fixes the first; `isolcpus` and `nohz_full` fix the second.
 
 **Q: If you had one week, what would you do?**
-Fix the correctness gaps first — gateway-assigned client IDs, backpressure instead of silent drops, per-client routing, and the multi-message read. Those are bugs, not optimisations. Then the hierarchical bitset, because it removes the only non-O(1) operation in the book and directly attacks the p99.9. Then a proper load-generating client so I'm measuring end-to-end rather than in-process. AF_XDP comes after that, because there's no point shaving kernel microseconds while messages are being silently dropped.
+Fix the correctness gaps first — gateway-assigned client IDs, backpressure instead of silent drops, per-client routing, and the multi-message read. Those are bugs, not optimisations, and there's no point shaving kernel microseconds while messages are being silently dropped.
+
+Then a proper load-generating client, so I'm measuring end-to-end rather than in-process — right now I can tell you the engine costs 18 ns per order, but I can't tell you what a client actually experiences, and kernel TCP alone is 10–30 µs. After that, AF_XDP, because that's where the real latency is.
+
+The bitset was on this list until recently; it's done, and it's why the book has no non-O(1) operations left.
 
 **Q: What did you learn building this?**
 That the algorithmic complexity is almost never the interesting part. Every real improvement came from memory behaviour — replacing a tree with an array, eliminating allocation, packing a struct into one cache line, padding two atomics apart. And that the tooling finds what reading doesn't: AddressSanitizer diagnosed a stack overflow instantly that a bare segfault told me nothing about, and the static analyser caught an unsigned-underflow bug in the imbalance calculation that would have silently returned garbage.
@@ -4810,8 +4880,8 @@ Being able to enumerate your own system's weaknesses is the strongest signal of 
 
 ### 31.2 Performance upgrades, ranked by value
 
-**1. Hierarchical bitset for best-price tracking** *(Chapter 13.8)*
-The only non-O(1) operation in the book. One bit per level in three tiers, ~2 MB, three `__builtin_clzll` calls. Directly attacks the cancel p99.9. Highest value, moderate effort.
+**~~1. Hierarchical bitset for best-price tracking~~ — DONE** *(Chapter 13.8)*
+Was the only non-O(1) operation in the book. Three-tier occupancy bitset, 127 KB, three `__builtin_clzll` lookups. Took `match_order` max from 1,073,882 ns to 84 ns and cancel p99.9 from 461 ns to 292 ns. Verified with `validate_bbo()` against a brute-force scan.
 
 **2. AF_XDP data path**
 The deployment box has a Realtek Killer E3000 (r8169), which has supported XDP since kernel 5.12. An `XDP_REDIRECT` program steers order-entry packets into an AF_XDP socket, bypassing the kernel TCP stack entirely — typically 1–2 µs saved per message, which is two orders of magnitude more than anything left in the engine. Requires implementing framing above raw packets. Highest absolute latency win.
@@ -4878,9 +4948,19 @@ Write `price_level.h`.
 
 ### Stage 4 — Order book, insert and cancel only
 
-Write `order_book.h`/`.cpp` with `add_order` that *never matches* (assume no crossing) and `cancel_order`. Include the BBO tracking and scans.
+Write `order_book.h`/`.cpp` with `add_order` that *never matches* (assume no crossing) and `cancel_order`. Track the BBO with the **linear scan** first — do not skip to the bitset.
 
-**Done when**: inserting and cancelling in random order leaves `best_bid_`/`best_ask_` correct at every step, verified against a brute-force scan of the whole array.
+**Done when**: inserting and cancelling in random order leaves `best_bid_`/`best_ask_` correct at every step, verified against a brute-force scan (`validate_bbo()`).
+
+### Stage 4b — Reproduce the 1 ms stall, then fix it
+
+Build `bench_matching` (seed N resting asks, send N aggressive buys) and look at the max. You should see roughly a millisecond against a p99.9 of tens of nanoseconds.
+
+Instrument the scan to count steps and confirm the cause before writing any fix. Then write `price_bitset.h` and wire it in.
+
+**Done when**: the max drops to double-digit nanoseconds, `validate_bbo()` still passes, and you can explain why 99 scans took 2 steps and one took 899,902.
+
+This stage matters more than the rest. Anyone can implement a bitset from a description; the skill is going from "max is 1 ms" to knowing *which* line causes it.
 
 ### Stage 5 — Matching
 
@@ -4994,7 +5074,8 @@ And TradeFeed's measured figures (i9-10900K, `performance` governor):
 | Engine per order (in-process) | 18 ns |
 | Book op p50 | 8–45 ns |
 | Book op p99 | 29–288 ns |
-| Book op p99.9 | 67–466 ns |
+| Book op p99.9 | 42–411 ns |
+| Best-price lookup | 3 `clz` loads, O(1) |
 | Engine throughput | 55M orders/sec |
 | Ring throughput (distinct cores) | 52M msg/sec |
 | Ring throughput (SMT siblings) | 206M msg/sec |

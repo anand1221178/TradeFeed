@@ -35,10 +35,14 @@ bool OrderBook::add_order(OrderId id, ClientId client, Side side, OrderType type
 
     if (!o->is_filled() && type == OrderType::Limit) {
         if (side == Side::Buy) {
-            bids_[idx(price)].push(o);
+            PriceLevel& lvl = bids_[idx(price)];
+            if (lvl.empty()) bid_bits_.set(idx(price));
+            lvl.push(o);
             if (price > best_bid_) best_bid_ = price;
         } else {
-            asks_[idx(price)].push(o);
+            PriceLevel& lvl = asks_[idx(price)];
+            if (lvl.empty()) ask_bits_.set(idx(price));
+            lvl.push(o);
             if (price < best_ask_) best_ask_ = price;
         }
     } else {
@@ -56,10 +60,16 @@ bool OrderBook::cancel_order(OrderId id) {
     Price p = o->price;
     if (o->side == Side::Buy) {
         bids_[idx(p)].remove(o);
-        if (bids_[idx(p)].empty() && p == best_bid_) scan_best_bid();
+        if (bids_[idx(p)].empty()) {
+            bid_bits_.clear(idx(p));
+            if (p == best_bid_) scan_best_bid();
+        }
     } else {
         asks_[idx(p)].remove(o);
-        if (asks_[idx(p)].empty() && p == best_ask_) scan_best_ask();
+        if (asks_[idx(p)].empty()) {
+            ask_bits_.clear(idx(p));
+            if (p == best_ask_) scan_best_ask();
+        }
     }
 
     unreg(o);
@@ -108,12 +118,18 @@ void OrderBook::match_limit(Order* aggressor) {
     if (aggressor->side == Side::Buy) {
         while (!aggressor->is_filled() && best_ask_ <= aggressor->price && best_ask_ <= MAX_PRICE) {
             drain_level(asks_[idx(best_ask_)], aggressor, Side::Buy);
-            if (asks_[idx(best_ask_)].empty()) scan_best_ask();
+            if (asks_[idx(best_ask_)].empty()) {
+                ask_bits_.clear(idx(best_ask_));
+                scan_best_ask();
+            }
         }
     } else {
         while (!aggressor->is_filled() && best_bid_ >= aggressor->price && best_bid_ != INVALID_PRICE) {
             drain_level(bids_[idx(best_bid_)], aggressor, Side::Sell);
-            if (bids_[idx(best_bid_)].empty()) scan_best_bid();
+            if (bids_[idx(best_bid_)].empty()) {
+                bid_bits_.clear(idx(best_bid_));
+                scan_best_bid();
+            }
         }
     }
 }
@@ -122,49 +138,51 @@ void OrderBook::match_market(Order* aggressor) {
     if (aggressor->side == Side::Buy) {
         while (!aggressor->is_filled() && best_ask_ <= MAX_PRICE) {
             drain_level(asks_[idx(best_ask_)], aggressor, Side::Buy);
-            if (asks_[idx(best_ask_)].empty()) scan_best_ask();
+            if (asks_[idx(best_ask_)].empty()) {
+                ask_bits_.clear(idx(best_ask_));
+                scan_best_ask();
+            }
         }
     } else {
         while (!aggressor->is_filled() && best_bid_ != INVALID_PRICE) {
             drain_level(bids_[idx(best_bid_)], aggressor, Side::Sell);
-            if (bids_[idx(best_bid_)].empty()) scan_best_bid();
+            if (bids_[idx(best_bid_)].empty()) {
+                bid_bits_.clear(idx(best_bid_));
+                scan_best_bid();
+            }
         }
     }
 }
 
 // ponytail: linear scan from last best. Typically 1-3 ticks in normal markets.
 // Upgrade to hierarchical bitset (__builtin_clzll) if profiling shows this matters.
-void OrderBook::scan_best_bid() {
-    uint64_t steps = 0;
-    ++scan_calls_;
-    for (Price p = best_bid_; p >= MIN_PRICE; --p) {
-        ++steps;
-        if (!bids_[idx(p)].empty()) {
-            best_bid_ = p;
-            scan_steps_ += steps;
-            if (steps > scan_worst_) scan_worst_ = steps;
-            return;
-        }
+bool OrderBook::validate_bbo() const {
+    Price bb = INVALID_PRICE;
+    for (Price p = MAX_PRICE; p >= MIN_PRICE; --p) {
+        if (!bids_[idx(p)].empty()) { bb = p; break; }
         if (p == MIN_PRICE) break;
     }
-    best_bid_ = INVALID_PRICE;
-    scan_steps_ += steps;
-    if (steps > scan_worst_) scan_worst_ = steps;
+    Price ba = MAX_PRICE + 1;
+    for (Price p = MIN_PRICE; p <= MAX_PRICE; ++p) {
+        if (!asks_[idx(p)].empty()) { ba = p; break; }
+    }
+    return bb == best_bid_ && ba == best_ask_;
+}
+
+// O(1): three count-leading/trailing-zero lookups through the tiered bitset,
+// independent of how far the next occupied level is.
+void OrderBook::scan_best_bid() {
+    ++scan_calls_;
+    const size_t i = bid_bits_.highest();
+    best_bid_ = (i == PriceBitset::NONE)
+              ? INVALID_PRICE
+              : static_cast<Price>(i + MIN_PRICE);
 }
 
 void OrderBook::scan_best_ask() {
-    uint64_t steps = 0;
     ++scan_calls_;
-    for (Price p = best_ask_; p <= MAX_PRICE; ++p) {
-        ++steps;
-        if (!asks_[idx(p)].empty()) {
-            best_ask_ = p;
-            scan_steps_ += steps;
-            if (steps > scan_worst_) scan_worst_ = steps;
-            return;
-        }
-    }
-    best_ask_ = MAX_PRICE + 1;
-    scan_steps_ += steps;
-    if (steps > scan_worst_) scan_worst_ = steps;
+    const size_t i = ask_bits_.lowest();
+    best_ask_ = (i == PriceBitset::NONE)
+              ? MAX_PRICE + 1
+              : static_cast<Price>(i + MIN_PRICE);
 }
