@@ -16,6 +16,11 @@
 
 static std::atomic<bool> g_running{true};
 
+static int core_from_env(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    return v ? std::atoi(v) : fallback;
+}
+
 static void signal_handler(int) {
     g_running.store(false, std::memory_order_relaxed);
 }
@@ -68,16 +73,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Distinct physical cores by default. SMT siblings give a ~4x faster ring
+    // handoff but share L1/L2, so the gateway evicts the engine's working set.
+    // Override with ENGINE_CORE / GATEWAY_CORE to measure the tradeoff.
+    [[maybe_unused]] const int engine_core  = core_from_env("ENGINE_CORE",  1);
+    [[maybe_unused]] const int gateway_core = core_from_env("GATEWAY_CORE", 2);
+
     std::thread engine_thread([&] {
 #ifdef __linux__
-        pin_thread("engine", 1);
+        pin_thread("engine", engine_core);
 #endif
         engine.run(g_running);
     });
 
     std::thread gateway_thread([&] {
 #ifdef __linux__
-        pin_thread("gateway", 2);
+        pin_thread("gateway", gateway_core);
 #endif
         gateway.run(g_running);
     });

@@ -51,13 +51,19 @@ MEMGB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo)
 
 echo
 echo "=== cpu topology (pin engine and gateway to distinct PHYSICAL cores) ==="
-if command -v lscpu >/dev/null; then
-    lscpu -e=CPU,CORE,SOCKET 2>/dev/null | head -8
-    SIBS=$(cat /sys/devices/system/cpu/cpu1/topology/thread_siblings_list 2>/dev/null || echo "?")
-    echo "  cpu1 thread siblings: $SIBS"
-    [[ "$SIBS" == *","* ]] && warn "cpu1 is hyperthreaded with $SIBS — engine(1)/gateway(2) may share L1/L2"
+ENG_CORE=${ENGINE_CORE:-1}
+GW_CORE=${GATEWAY_CORE:-2}
+sib_of() { cat "/sys/devices/system/cpu/cpu$1/topology/thread_siblings_list" 2>/dev/null || echo "?"; }
+ENG_SIBS=$(sib_of "$ENG_CORE")
+GW_SIBS=$(sib_of "$GW_CORE")
+echo "  engine  -> cpu${ENG_CORE} (siblings: ${ENG_SIBS})"
+echo "  gateway -> cpu${GW_CORE} (siblings: ${GW_SIBS})"
+
+if [[ ",${ENG_SIBS}," == *",${GW_CORE},"* ]]; then
+    warn "engine and gateway are SMT siblings — ~4x faster ring handoff,"
+    warn "  but they share L1/L2 and the gateway will evict the engine's working set"
 else
-    warn "lscpu not installed (pacman -S util-linux)"
+    ok "engine and gateway are on distinct physical cores (engine keeps its own L1)"
 fi
 
 echo

@@ -2806,7 +2806,7 @@ constexpr size_t RING_SIZE = 1 << 18;   // 262,144 slots
 
 262,144 × 64 bytes = **16 MB per ring**, 32 MB for both.
 
-Why so large? The ring absorbs *bursts*. If the gateway receives a 10,000-message burst while the engine is mid-sweep on a deep order, the ring buffers them instead of forcing backpressure onto TCP. At 67M orders/sec of drain rate, 262K slots is ~4 ms of buffer — comfortably more than any plausible stall.
+Why so large? The ring absorbs *bursts*. If the gateway receives a 10,000-message burst while the engine is mid-sweep on a deep order, the ring buffers them instead of forcing backpressure onto TCP. At 55M orders/sec of drain rate, 262K slots is ~4 ms of buffer — comfortably more than any plausible stall.
 
 The cost is 32 MB of RAM and the fact that these must be `static` or heap-allocated, never stack (Chapter 4.1 — this is exactly the bug that segfaulted the benchmark).
 
@@ -2891,7 +2891,7 @@ Given the same input sequence, the engine must produce the same output. Always.
 
 This is why TradeFeed's engine is **single-threaded**. Parallelising the matching of a single book would make execution order depend on thread scheduling — and then the same inputs could produce different trades. Real exchanges shard *by symbol* (each symbol's book on one thread) and never within a book.
 
-**That is the answer to "why don't you parallelise the matching engine?"** Not because it's hard — because it would be wrong. The engine at 67M orders/sec is nowhere near being the bottleneck anyway.
+**That is the answer to "why don't you parallelise the matching engine?"** Not because it's hard — because it would be wrong. The engine at 55M orders/sec is nowhere near being the bottleneck anyway.
 
 ### 19.4 Price representation and ticks
 
@@ -2935,7 +2935,7 @@ Every transition emits a message to the owning client. That is what `MatchingEng
 A: It runs a continuous double auction — maintaining a queue of unmatched buy and sell orders and executing trades by a published, deterministic priority rule whenever the prices cross.
 
 **Q: Why is your matching engine single-threaded?**
-A: Determinism. Parallelising a single book would make execution order depend on thread scheduling, so identical inputs could produce different trades — which breaks regulatory reconstruction, replay-based recovery, and regression testing. Real exchanges shard by symbol, never within a book. At 67M orders/sec the engine isn't the bottleneck anyway.
+A: Determinism. Parallelising a single book would make execution order depend on thread scheduling, so identical inputs could produce different trades — which breaks regulatory reconstruction, replay-based recovery, and regression testing. Real exchanges shard by symbol, never within a book. At 55M orders/sec the engine isn't the bottleneck anyway.
 
 ### Exercises
 
@@ -4149,13 +4149,42 @@ static void pin_thread(int core) {
 
 Migrations happen for reasons you don't control: another process wakes, an interrupt is delivered, the scheduler rebalances. Pinning removes the variable entirely. The engine's ~5 KB working set (Chapter 6.5) stays resident in one core's L1 permanently.
 
-**Choosing cores.** Core 0 typically handles interrupts and kernel work — avoid it. On a hyperthreaded CPU, cores 0–9 and 10–19 may be siblings sharing L1/L2 on the i9-10900K; pinning two busy threads to siblings means they fight for the same cache. The robust approach is to check the topology:
+**Choosing cores.** Core 0 typically handles interrupts and kernel work — avoid it. Beyond that the choice is a real, measurable tradeoff. Check the topology first:
 
 ```bash
-lscpu -e           # shows CPU, CORE, SOCKET, L1/L2/L3 mapping
+lscpu -e                                              # CPU / CORE / SOCKET mapping
+cat /sys/devices/system/cpu/cpu1/topology/thread_siblings_list
 ```
 
-and pin to distinct *physical* cores.
+On the i9-10900K target this reports `1,11` — so CPUs 0–9 are distinct physical cores and 10–19 are their SMT siblings.
+
+### Measured: siblings vs distinct cores
+
+Running `bench_ring` both ways on that machine:
+
+| | cpu1 → cpu2 (distinct cores) | cpu1 → cpu11 (SMT siblings) | Ratio |
+|---|---|---|---|
+| One-way latency p50 | 84 ns | **22 ns** | 3.8× |
+| One-way latency p99 | 102 ns | **27 ns** | 3.8× |
+| Throughput | 52M msg/s | **206M msg/s** | 4.0× |
+| Queueing latency p50 | 17,031 ns | **35 ns** | 486× |
+
+SMT siblings share L1 and L2, so a message cache line **never leaves the core** — no L3 round trip, no coherence transaction. Distinct physical cores on Comet Lake's ring bus pay ~84 ns each way, which matches published core-to-core figures for that architecture.
+
+The 486× queueing gap is the same cause amplified. On siblings, producer and consumer stay in lockstep and the ring sits ~2 messages deep. On distinct cores the producer sprints ahead and the ring settles ~900 deep, so a message waits behind 900 others.
+
+### So why does TradeFeed default to distinct cores?
+
+Because the ring handoff is **once per message**, while the engine performs many memory accesses per message — price level, order, pool free list, lookup table. Its ~5 KB working set living permanently in L1 is worth more than 60 ns saved on handoff. A gateway sharing that L1 would be `memcpy`ing network buffers through it and evicting the engine's hot data continuously.
+
+The benchmark cannot settle this — it only measures the ring, not the engine's cache residency. Deciding it properly needs an end-to-end test under realistic load. Both are therefore configurable:
+
+```bash
+ENGINE_CORE=1 GATEWAY_CORE=2  ./tradefeed    # default: distinct cores
+ENGINE_CORE=1 GATEWAY_CORE=11 ./tradefeed    # SMT siblings
+```
+
+**This is a good thing to be able to discuss.** The answer is not "siblings are faster" or "distinct cores are better" — it is "siblings win the handoff by 4×, distinct cores protect the engine's L1, the ring benchmark can't arbitrate because it doesn't model the engine's working set, and here is the experiment that would."
 
 **Isolating cores.** The complete solution removes cores from the scheduler entirely:
 
@@ -4321,35 +4350,63 @@ Cancelling in insertion order would always hit the head of each list and always 
 
 Seeded RNGs (`std::mt19937 rng(42)`) make every run reproducible — essential for comparing before and after a change.
 
-### 28.5 Reading the output
+### 28.5 Reference results — i9-10900K, Arch Linux, GCC 16
 
+These are the canonical numbers: real x86 TSC, sub-nanosecond resolution, `performance` governor. (The Apple Silicon dev machine has ~41.67 ns timer granularity, which floors anything faster to 0 — fine for relative comparison, useless for absolute p50.)
+
+**Order book**
+
+| Operation | p50 | p90 | p99 | p99.9 | max |
+|-----------|-----|-----|-----|-------|-----|
+| Add order (no match) | 8 ns | 30 ns | 88 ns | 380 ns | 29 µs |
+| Cancel order | 24 ns | 87 ns | 166 ns | 466 ns | 26 µs |
+| Match order | 13 ns | 23 ns | 29 ns | 67 ns | **1.08 ms** |
+| Mixed: add (resting) | 10 ns | 21 ns | 50 ns | 131 ns | 28 µs |
+| Mixed: cancel | 19 ns | 81 ns | 206 ns | 461 ns | 33 µs |
+| Mixed: match | 45 ns | 163 ns | 288 ns | 411 ns | 28 µs |
+
+Engine throughput: **55M orders/sec**, 18 ns average per order — including ring pop, dispatch, book operation, and outbound emit.
+
+**SPSC ring** (producer cpu1, consumer cpu2 — distinct physical cores)
+
+| Measurement | Value |
+|-------------|-------|
+| Single-thread round-trip | 5.4 ns |
+| Burst push | 4.2 ns/op (240M ops/s) |
+| Burst pop | 1.6 ns/op (643M ops/s) |
+| One-way core-to-core latency p50 | 84 ns |
+| Cross-core throughput | 52M msg/s |
+
+On SMT siblings those become 22 ns and 206M msg/s — the full comparison is in Chapter 27.3.
+
+### 28.6 Reading the numbers
+
+**The engine has enormous headroom.** NASDAQ processes ~1–5M messages/sec across *all* symbols on its busiest days. A single-symbol engine at 55M/sec is 10–50× that. The conclusion is not "my engine is fast" — it is "the engine is not the bottleneck." Kernel TCP alone costs 10–30 µs round trip, roughly a thousand times the 18 ns of matching.
+
+**Push is slower than pop (4.2 vs 1.6 ns).** The burst test writes 65,536 × 64 B = 4 MB, exceeding L2. Every write to an uncached line needs a read-for-ownership — fetch it exclusive before modifying — plus eventual writeback. The following pop reads data that is still resident. Non-temporal stores (`_mm256_stream_si256`) bypass RFO for known-streaming writes, worth trying if the ring ever becomes the constraint.
+
+**The 1.08 ms max on `match_order` is not noise.** It reproduced within 1.5% across runs (1,063,786 ns then 1,079,085 ns) — deterministic, not random preemption. Leading suspect: `khugepaged` collapsing the ~112 MB of arenas (48 MB price levels + 64 MB pool) into 2 MB huge pages in the background, taking page-table locks and copying memory.
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled   # re-run and compare
 ```
-  add_order   n=500000   p50=0ns  p90=42ns  p99=83ns  p99.9=625ns  min=0ns  max=12751ns
-```
 
-- **p50 = 0ns** — faster than the ARM timer's 41.67 ns resolution (Chapter 10.2). On x86 you'd see a real figure around 20–40 ns.
-- **p99 = 83ns** — two timer ticks. Occasional cache misses.
-- **p99.9 = 625ns** — the tail. Most likely a `scan_best_bid` walking several levels, or a `fills_` vector growth.
-- **max = 12751ns** — almost certainly the OS descheduling the thread. On an isolated, pinned core this largely disappears.
+The proper fix is the Chapter 31 item: `madvise(MADV_HUGEPAGE)` on the arenas at construction plus pre-faulting every page at startup, turning a mid-trade stall into a startup cost.
 
-```
-  Processed 200000 orders in 2963957 ns
-  Throughput: 67477353 orders/sec
-```
+**The 26–33 µs maxima elsewhere** are scheduler preemption — the benchmark shares a core with everything else. `taskset` plus `isolcpus` should remove them.
 
-67M orders/sec, ~15 ns per order. For scale, NASDAQ peaks around 1–5M messages/sec **across all symbols**. A single-symbol engine at 67M/sec has enormous headroom — the honest conclusion is that the engine is not the bottleneck; the network is.
-
-### 28.6 What the benchmarks don't measure
+### 28.7 What the benchmarks don't measure
 
 Being straight about this is more impressive than the numbers:
 
 - **No network.** Everything is in-process. Real end-to-end latency is dominated by NIC, kernel, and TCP — microseconds, not nanoseconds.
-- **Single-threaded.** `bench_engine_throughput` pre-fills the ring and drains it on one thread, so there's no producer/consumer contention.
+- **Single-threaded engine test.** `bench_engine_throughput` pre-fills the ring and drains it on one thread, so there's no producer/consumer contention.
 - **Synthetic flow.** Uniform random prices in a tight band. Real flow is bursty, clustered at round numbers, and has fat-tailed sizes.
-- **Warm cache, no other load.** A production box runs monitoring, logging, and other processes.
-- **macOS timer resolution.** ~41.67 ns granularity destroys p50 fidelity. The x86 numbers will be far more informative.
+- **No isolation.** No `isolcpus`, no IRQ affinity — hence the tens-of-microseconds maxima.
+- **One symbol.** No sharding, no cross-book effects.
 
-**What would make them honest**: a load-generating client over loopback and then over a real NIC, measuring true round-trip; replaying a real ITCH session for realistic flow; and running on the isolated, pinned Linux box.
+**What would make them honest**: a load-generating client over loopback and then over a real NIC, measuring true round-trip; replaying a captured ITCH session for realistic flow; and running on isolated, pinned cores.
 
 ### Interview Questions
 
@@ -4359,7 +4416,7 @@ A: It enables the full instruction set of the build machine — AVX2, BMI2, `LZC
 **Q: Does `-O3` vectorise your matching loop?**
 A: No. Auto-vectorisation needs countable loops over contiguous data. Walking an intrusive linked list is inherently serial — you can't compute the next address until the current node loads. It does vectorise the sort and analytics loops in the benchmarks. That's why I optimise the matching path for cache behaviour rather than SIMD.
 
-**Q: Your benchmarks show 67M orders/sec. What are they not telling me?**
+**Q: Your benchmarks show 55M orders/sec. What are they not telling me?**
 A: They're in-process with no network, single-threaded with no ring contention, driven by synthetic uniform flow on a warm cache with nothing else running, and measured on a platform with 41 ns timer granularity. Real end-to-end latency is dominated by NIC and kernel — microseconds. The engine number tells me the engine isn't the bottleneck; that's all it tells me.
 
 **Q: How did you find the stack overflow?**
@@ -4636,12 +4693,12 @@ Every one of those numbers is small because of a specific decision made in Parts
 >
 > The performance work is all about eliminating memory stalls. Orders come from a pre-allocated pool, so there's no `malloc` on the hot path. Price levels are a direct-indexed array rather than a tree, so a lookup is one array access instead of twenty pointer-chasing cache misses. Each level is an intrusive doubly-linked list, so there's no per-node allocation and cancels are O(1). Order lookup is a direct-address table keyed on `id & mask`, because I assign the IDs sequentially and don't need hashing. The `Order` struct is exactly one cache line with the match-critical fields in the first sixteen bytes.
 >
-> It benchmarks at 67 million orders per second in-process, with sub-100-nanosecond p99 on book operations and a 2.5-nanosecond ring push. The honest caveat is those are in-process numbers — real end-to-end latency is dominated by the NIC and kernel, and the next thing I'd build is an AF_XDP data path to attack that.
+> It benchmarks at 55 million orders per second in-process on an i9-10900K, with p50 of 8 nanoseconds on inserts and 13 on matches, and an 84-nanosecond one-way core-to-core handoff through the ring. The honest caveat is those are in-process numbers — real end-to-end latency is dominated by the NIC and kernel, and the next thing I'd build is an AF_XDP data path to attack that.
 
 ### 30.2 Questions on architecture
 
 **Q: Why is the matching engine single-threaded? Isn't that leaving performance on the table?**
-Determinism. If matching a single book were parallel, execution order would depend on thread scheduling, so the same input sequence could produce different trades. That breaks regulatory reconstruction, replay-based recovery, and regression testing — all non-negotiable for an exchange. Real venues shard by symbol, one book per thread, and never parallelise within a book. Empirically it's also not the constraint: 67M orders/sec is 15–60× NASDAQ's all-symbol peak.
+Determinism. If matching a single book were parallel, execution order would depend on thread scheduling, so the same input sequence could produce different trades. That breaks regulatory reconstruction, replay-based recovery, and regression testing — all non-negotiable for an exchange. Real venues shard by symbol, one book per thread, and never parallelise within a book. Empirically it's also not the constraint: 55M orders/sec is 10–50× NASDAQ's all-symbol peak.
 
 **Q: Walk me through your threading model.**
 Two worker threads with strict data ownership. The gateway owns the sockets and client state; the engine owns the book, the pool, and every `Order`. Nothing is written by both. They communicate through two SPSC rings — inbound and outbound — where each thread writes only its own index. That's why I need no locks: I structured ownership so there's almost nothing to synchronise, then made that small remainder lock-free.
@@ -4925,18 +4982,22 @@ Memorise the orders of magnitude.
 | Kernel TCP stack (loopback round trip) | ~10–30 µs |
 | Nagle delay | up to 40 ms |
 
-And TradeFeed's measured figures:
+And TradeFeed's measured figures (i9-10900K, `performance` governor):
 
 | Operation | Value |
 |-----------|-------|
-| Ring push (burst) | 2.5 ns |
-| Ring pop (burst) | 2.3 ns |
+| Ring push (burst) | 4.2 ns |
+| Ring pop (burst) | 1.6 ns |
 | Ring round trip (single thread) | 5.4 ns |
-| Engine per order (in-process) | ~15 ns |
-| Book op p99 | 42–125 ns |
-| Book op p99.9 | 208–625 ns |
-| Engine throughput | 67M orders/sec |
-| Ring throughput (cross-core) | 161M msgs/sec |
+| Core-to-core one-way (distinct cores) | 84 ns |
+| Core-to-core one-way (SMT siblings) | 22 ns |
+| Engine per order (in-process) | 18 ns |
+| Book op p50 | 8–45 ns |
+| Book op p99 | 29–288 ns |
+| Book op p99.9 | 67–466 ns |
+| Engine throughput | 55M orders/sec |
+| Ring throughput (distinct cores) | 52M msg/sec |
+| Ring throughput (SMT siblings) | 206M msg/sec |
 
 ---
 
