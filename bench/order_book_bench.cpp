@@ -116,6 +116,10 @@ static void bench_matching() {
     stats.print("match_order", tpn);
     std::printf("  Total matches: %llu\n",
                 static_cast<unsigned long long>(book.match_count()));
+    std::printf("  Best-price scans: %llu calls, %llu total steps, %llu worst single scan\n",
+                static_cast<unsigned long long>(book.scan_calls()),
+                static_cast<unsigned long long>(book.scan_steps()),
+                static_cast<unsigned long long>(book.scan_worst()));
 }
 
 static void bench_mixed_workload() {
@@ -186,6 +190,10 @@ static void bench_mixed_workload() {
     match_stats.print("match (aggressive)", tpn);
     std::printf("  Total matches: %llu\n",
                 static_cast<unsigned long long>(book.match_count()));
+    std::printf("  Best-price scans: %llu calls, %llu total steps, %llu worst single scan\n",
+                static_cast<unsigned long long>(book.scan_calls()),
+                static_cast<unsigned long long>(book.scan_steps()),
+                static_cast<unsigned long long>(book.scan_worst()));
 }
 
 static void bench_engine_throughput() {

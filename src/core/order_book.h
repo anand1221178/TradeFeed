@@ -30,6 +30,11 @@ class OrderBook {
     uint64_t match_count_ = 0;
     std::vector<Fill> fills_;
 
+    // Instrumentation for the best-price scan (Chapter 13.7's known weakness).
+    uint64_t scan_calls_ = 0;
+    uint64_t scan_steps_ = 0;
+    uint64_t scan_worst_ = 0;
+
     size_t idx(Price p) const { return p - MIN_PRICE; }
 
     Order* lookup(OrderId id) const {
@@ -62,4 +67,8 @@ public:
     void clear_fills() { fills_.clear(); }
     uint64_t match_count() const { return match_count_; }
     size_t active_orders() const { return pool_.capacity() - pool_.available(); }
+
+    uint64_t scan_calls() const { return scan_calls_; }
+    uint64_t scan_steps() const { return scan_steps_; }
+    uint64_t scan_worst() const { return scan_worst_; }
 };

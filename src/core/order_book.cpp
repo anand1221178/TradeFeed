@@ -135,16 +135,36 @@ void OrderBook::match_market(Order* aggressor) {
 // ponytail: linear scan from last best. Typically 1-3 ticks in normal markets.
 // Upgrade to hierarchical bitset (__builtin_clzll) if profiling shows this matters.
 void OrderBook::scan_best_bid() {
+    uint64_t steps = 0;
+    ++scan_calls_;
     for (Price p = best_bid_; p >= MIN_PRICE; --p) {
-        if (!bids_[idx(p)].empty()) { best_bid_ = p; return; }
+        ++steps;
+        if (!bids_[idx(p)].empty()) {
+            best_bid_ = p;
+            scan_steps_ += steps;
+            if (steps > scan_worst_) scan_worst_ = steps;
+            return;
+        }
         if (p == MIN_PRICE) break;
     }
     best_bid_ = INVALID_PRICE;
+    scan_steps_ += steps;
+    if (steps > scan_worst_) scan_worst_ = steps;
 }
 
 void OrderBook::scan_best_ask() {
+    uint64_t steps = 0;
+    ++scan_calls_;
     for (Price p = best_ask_; p <= MAX_PRICE; ++p) {
-        if (!asks_[idx(p)].empty()) { best_ask_ = p; return; }
+        ++steps;
+        if (!asks_[idx(p)].empty()) {
+            best_ask_ = p;
+            scan_steps_ += steps;
+            if (steps > scan_worst_) scan_worst_ = steps;
+            return;
+        }
     }
     best_ask_ = MAX_PRICE + 1;
+    scan_steps_ += steps;
+    if (steps > scan_worst_) scan_worst_ = steps;
 }
