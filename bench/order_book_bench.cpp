@@ -33,6 +33,7 @@ static double calibrate_tsc() {
     uint64_t t0_tsc = rdtsc();
     volatile int sink = 0;
     for (int i = 0; i < 100'000'000; ++i) sink += i;
+    (void)sink;
     uint64_t t1_tsc = rdtsc();
     auto t1_wall = std::chrono::steady_clock::now();
 

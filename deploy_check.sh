@@ -72,8 +72,14 @@ CMDLINE=$(cat /proc/cmdline)
     || warn "no isolcpus — add 'isolcpus=1,2 nohz_full=1,2 rcu_nocbs=1,2' to kernel cmdline"
 
 RTRUN=$(cat /proc/sys/kernel/sched_rt_runtime_us 2>/dev/null || echo "?")
-[ "$RTRUN" = "-1" ] && ok "RT throttling disabled" \
-                    || warn "RT throttle at ${RTRUN}us/1000000us — causes periodic stalls under SCHED_FIFO"
+RTPER=$(cat /proc/sys/kernel/sched_rt_period_us  2>/dev/null || echo "1000000")
+if [ "$RTRUN" = "-1" ]; then
+    ok "RT throttling disabled"
+elif [ "$RTRUN" != "?" ] && [ "$RTRUN" -ge "$RTPER" ]; then
+    ok "RT throttle at ${RTRUN}/${RTPER}us — effectively unthrottled"
+else
+    warn "RT throttle at ${RTRUN}/${RTPER}us — periodic stalls under SCHED_FIFO"
+fi
 
 [ "$(id -u)" -eq 0 ] && ok "running as root — SCHED_FIFO will apply" \
                      || warn "not root — SCHED_FIFO will be skipped (sudo, or: setcap cap_sys_nice+ep ./build/tradefeed)"

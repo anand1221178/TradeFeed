@@ -3,11 +3,39 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 #include <vector>
 #include <algorithm>
 #include <chrono>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
+// Cross-core numbers are meaningless unless the threads actually stay on
+// distinct cores. Override with PRODUCER_CORE / CONSUMER_CORE.
+static int producer_core() {
+    const char* e = std::getenv("PRODUCER_CORE");
+    return e ? std::atoi(e) : 1;
+}
+static int consumer_core() {
+    const char* e = std::getenv("CONSUMER_CORE");
+    return e ? std::atoi(e) : 2;
+}
+
+static void pin_to(int core) {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)core;
+#endif
+}
 
 struct alignas(CACHE_LINE) TestMsg {
     uint64_t sequence;
@@ -20,6 +48,7 @@ static double calibrate_tsc() {
     uint64_t t0_tsc = rdtsc();
     volatile int sink = 0;
     for (int i = 0; i < 100'000'000; ++i) sink += i;
+    (void)sink;
     uint64_t t1_tsc = rdtsc();
     auto t1_wall = std::chrono::steady_clock::now();
     double wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1_wall - t0_wall).count();
@@ -95,16 +124,20 @@ static void bench_cross_core_latency() {
     std::atomic<bool> done{false};
 
     std::thread consumer([&] {
+        pin_to(consumer_core());
         ready.store(true);
         TestMsg msg;
         for (int i = 0; i < N; ++i) {
             while (!ring.pop(msg)) {}
-            latencies[i] = rdtsc() - msg.tsc;
+            uint64_t delta = rdtsc() - msg.tsc;
+            // Cross-core TSC read can appear to go backwards; treat wrap as 0.
+            latencies[i] = (delta > (1ULL << 62)) ? 0 : delta;
         }
         done.store(true);
     });
 
     while (!ready.load()) {}
+    pin_to(producer_core());
 
     TestMsg msg{};
     for (int i = 0; i < N; ++i) {
@@ -133,6 +166,7 @@ static void bench_throughput_cross_core() {
     std::atomic<bool> ready{false};
 
     std::thread consumer([&] {
+        pin_to(consumer_core());
         ready.store(true);
         TestMsg msg;
         for (int i = 0; i < N; ++i)
@@ -140,6 +174,7 @@ static void bench_throughput_cross_core() {
     });
 
     while (!ready.load()) {}
+    pin_to(producer_core());
 
     TestMsg msg{};
     uint64_t t0 = rdtsc();
@@ -158,6 +193,13 @@ static void bench_throughput_cross_core() {
 int main() {
     std::printf("TradeFeed SPSC Ring Buffer Benchmarks\n");
     std::printf("======================================\n");
+#ifdef __linux__
+    std::printf("Cross-core tests: producer=cpu%d consumer=cpu%d "
+                "(override with PRODUCER_CORE/CONSUMER_CORE)\n",
+                producer_core(), consumer_core());
+#else
+    std::printf("Cross-core tests: unpinned (no affinity API on this platform)\n");
+#endif
     std::printf("Calibrating TSC...\n");
 
     bench_single_thread_throughput();
