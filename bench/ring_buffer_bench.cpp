@@ -113,8 +113,59 @@ static void bench_burst_throughput() {
                 total_ops / ((pop_total / tpn) / 1e9) / 1e6);
 }
 
+// True one-way core-to-core latency: exactly one message in flight, so the
+// measurement is transfer cost, not queueing delay.
+static void bench_ping_pong_latency() {
+    std::printf("\n=== Core-to-Core Latency (ping-pong, 1 msg in flight) ===\n");
+    static SPSCRing<TestMsg, 1024> req;
+    static SPSCRing<TestMsg, 1024> resp;
+    double tpn = calibrate_tsc();
+
+    constexpr int N = 200'000;
+    std::vector<uint64_t> rtt(N);
+    std::atomic<bool> ready{false};
+    std::atomic<bool> stop{false};
+
+    std::thread responder([&] {
+        pin_to(consumer_core());
+        ready.store(true);
+        TestMsg m;
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (req.pop(m))
+                while (!resp.push(m)) {}
+        }
+    });
+
+    while (!ready.load()) {}
+    pin_to(producer_core());
+
+    TestMsg m{};
+    for (int i = 0; i < 2000; ++i) {          // warmup
+        m.sequence = i;
+        while (!req.push(m)) {}
+        while (!resp.pop(m)) {}
+    }
+
+    for (int i = 0; i < N; ++i) {
+        m.sequence = i;
+        uint64_t t0 = rdtsc();
+        while (!req.push(m)) {}
+        while (!resp.pop(m)) {}
+        rtt[i] = rdtsc() - t0;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    responder.join();
+
+    std::sort(rtt.begin(), rtt.end());
+    auto ow = [&](size_t i) { return rtt[i] / tpn / 2.0; };   // one-way = rtt / 2
+    std::printf("  n=%d  p50=%.0fns  p90=%.0fns  p99=%.0fns  p99.9=%.0fns  min=%.0fns\n",
+                N, ow(N*50/100), ow(N*90/100), ow(N*99/100), ow(N*999/1000), ow(0));
+    std::printf("  (round-trip p50 = %.0fns)\n", rtt[N/2] / tpn);
+}
+
 static void bench_cross_core_latency() {
-    std::printf("\n=== Cross-Core Latency (Producer -> Consumer) ===\n");
+    std::printf("\n=== Queueing Latency (saturated producer — NOT transfer latency) ===\n");
     SPSCRing<TestMsg, 1 << 16> ring;
     double tpn = calibrate_tsc();
 
@@ -204,6 +255,7 @@ int main() {
 
     bench_single_thread_throughput();
     bench_burst_throughput();
+    bench_ping_pong_latency();
     bench_cross_core_latency();
     bench_throughput_cross_core();
 
